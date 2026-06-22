@@ -345,6 +345,44 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:10px; h
       <div class="tog-row"><span class="tog-label">SHADOWS</span><div class="tog on" id="tog-shadows"></div></div>
     </div>
 
+    <div class="psec">
+      <div class="plabel">Post Processing</div>
+      <div class="tog-row"><span class="tog-label">SSAO</span><div class="tog on" id="tog-ssao"></div></div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">AO STRENGTH</span><span class="sl-val" id="vAoStr">0.7</span></div>
+        <input type="range" id="slAoStr" min="0" max="1.5" step="0.05" value="0.7">
+      </div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">AO RADIUS</span><span class="sl-val" id="vAoRad">0.4</span></div>
+        <input type="range" id="slAoRad" min="0.05" max="1.0" step="0.05" value="0.4">
+      </div>
+      <div class="tog-row"><span class="tog-label">BLOOM</span><div class="tog on" id="tog-bloom"></div></div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">BLOOM THRESH</span><span class="sl-val" id="vBloomT">0.55</span></div>
+        <input type="range" id="slBloomT" min="0.1" max="1.0" step="0.05" value="0.55">
+      </div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">BLOOM STR</span><span class="sl-val" id="vBloomS">0.9</span></div>
+        <input type="range" id="slBloomS" min="0" max="3.0" step="0.1" value="0.9">
+      </div>
+      <div class="tog-row"><span class="tog-label">DEPTH OF FIELD</span><div class="tog" id="tog-dof"></div></div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">FOCUS DIST</span><span class="sl-val" id="vDofFocus">30</span></div>
+        <input type="range" id="slDofFocus" min="1" max="80" step="1" value="30">
+      </div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">DOF APERTURE</span><span class="sl-val" id="vDofAp">0.4</span></div>
+        <input type="range" id="slDofAp" min="0.0" max="2.0" step="0.05" value="0.4">
+      </div>
+      <div class="tog-row"><span class="tog-label">FILM GRAIN</span><div class="tog on" id="tog-grain"></div></div>
+      <div class="tog-row"><span class="tog-label">VIGNETTE</span><div class="tog on" id="tog-vignette"></div></div>
+      <div class="sl-row">
+        <div class="sl-head"><span class="sl-name">VIGNETTE STR</span><span class="sl-val" id="vVigStr">0.45</span></div>
+        <input type="range" id="slVigStr" min="0" max="1.0" step="0.05" value="0.45">
+      </div>
+      <div class="tog-row"><span class="tog-label">CHROMATIC AB.</span><div class="tog" id="tog-ca"></div></div>
+    </div>
+
   </div>
 </div>
 
@@ -366,10 +404,12 @@ setLoad(10,'Building renderer...');
 
 // ── RENDERER ─────────────────────────────────────────────────────────────────
 const wrap=document.getElementById('canvas-wrap');
-const renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true,logarithmicDepthBuffer:true});
+const renderer=new THREE.WebGLRenderer({antialias:false,preserveDrawingBuffer:true,logarithmicDepthBuffer:true});
 renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
 renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
-renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.0;
+renderer.toneMapping=THREE.NoToneMapping; // tone mapping done in composite shader
+renderer.toneMappingExposure=1.0;
+renderer.autoClear=false;
 wrap.appendChild(renderer.domElement);
 
 const scene=new THREE.Scene();
@@ -1369,13 +1409,440 @@ document.getElementById('btn-topdown').addEventListener('click',()=>{
 });
 document.getElementById('btn-export').addEventListener('click',()=>{
   const prev=renderer.getPixelRatio();renderer.setPixelRatio(4);renderer.setSize(wrap.clientWidth,wrap.clientHeight);
-  renderer.render(scene,camera);
+  renderPostProcess();
   const a=document.createElement('a');a.download='battlemap-4k.png';a.href=renderer.domElement.toDataURL('image/png');a.click();
   renderer.setPixelRatio(prev);onResize();
 });
 
-function onResize(){const w=wrap.clientWidth,h=wrap.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}
+function onResize(){
+  const w=wrap.clientWidth,h=wrap.clientHeight;
+  renderer.setSize(w,h,false);
+  camera.aspect=w/h;camera.updateProjectionMatrix();
+  resizeRTs(w,h);
+}
 window.addEventListener('resize',onResize);onResize();
+
+// ── POST PROCESS PIPELINE ─────────────────────────────────────────────────────
+// All passes implemented as raw WebGL2 shader quads on top of Three.js render targets
+
+const gl = renderer.getContext();
+
+// Render target factory
+function makeRT(w,h,opts={}){
+  return new THREE.WebGLRenderTarget(w,h,{
+    minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
+    format: opts.format||THREE.RGBAFormat,
+    type: opts.float ? THREE.HalfFloatType : THREE.UnsignedByteType,
+    depthBuffer: opts.depth||false, stencilBuffer:false,
+  });
+}
+function makeRTDepth(w,h){
+  const rt=new THREE.WebGLRenderTarget(w,h,{
+    minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,
+    format:THREE.RGBAFormat,type:THREE.UnsignedByteType,
+    depthBuffer:true,stencilBuffer:false,
+    depthTexture: new THREE.DepthTexture(w,h,THREE.UnsignedShortType),
+  });
+  return rt;
+}
+
+let W=wrap.clientWidth, H=wrap.clientHeight;
+// Main scene RT (with depth)
+let rtScene = makeRTDepth(W,H);
+// SSAO
+let rtSSAO = makeRT(W,H);
+let rtSSAOBlur = makeRT(W,H);
+// Bloom chain
+let rtBloomBright = makeRT(W,H,{float:true});
+let rtBloomH = makeRT(W>>1,H>>1,{float:true});
+let rtBloomV = makeRT(W>>1,H>>1,{float:true});
+let rtBloomH2 = makeRT(W>>2,H>>2,{float:true});
+let rtBloomV2 = makeRT(W>>2,H>>2,{float:true});
+// DoF
+let rtDoF = makeRT(W,H,{float:true});
+// Final composite
+let rtFinal = makeRT(W,H);
+
+function resizeRTs(w,h){
+  W=w;H=h;
+  [rtScene,rtSSAO,rtSSAOBlur,rtBloomBright,rtBloomH,rtBloomV,rtDoF,rtFinal].forEach(rt=>rt.setSize(w,h));
+  rtBloomH.setSize(w>>1,h>>1); rtBloomV.setSize(w>>1,h>>1);
+  rtBloomH2.setSize(w>>2,h>>2); rtBloomV2.setSize(w>>2,h>>2);
+}
+
+// Full-screen quad helper using Three.js
+const fsCamera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const fsGeo = new THREE.PlaneGeometry(2,2);
+
+function makeFSMat(frag, uniforms={}){
+  return new THREE.ShaderMaterial({
+    uniforms, depthTest:false, depthWrite:false,
+    vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}`,
+    fragmentShader: frag,
+  });
+}
+function renderFS(mat, target){
+  const mesh=new THREE.Mesh(fsGeo,mat);
+  const tmpScene=new THREE.Scene(); tmpScene.add(mesh);
+  renderer.setRenderTarget(target||null);
+  renderer.clear();
+  renderer.render(tmpScene,fsCamera);
+}
+
+// ── SSAO SHADER ──
+// Hemisphere kernel
+const KERNEL_SIZE=16;
+const ssaoKernel=[];
+for(let i=0;i<KERNEL_SIZE;i++){
+  const s=new THREE.Vector3((Math.random()*2-1),(Math.random()*2-1),Math.random()).normalize();
+  const scale=i/KERNEL_SIZE; s.multiplyScalar(.1+.9*scale*scale);
+  ssaoKernel.push(s);
+}
+// Noise texture for rotation
+const noiseData=new Float32Array(16*4);
+for(let i=0;i<16;i++){noiseData[i*4]=Math.random()*2-1;noiseData[i*4+1]=Math.random()*2-1;noiseData[i*4+2]=0;noiseData[i*4+3]=1;}
+const ssaoNoiseTex=new THREE.DataTexture(noiseData,4,4,THREE.RGBAFormat,THREE.FloatType);
+ssaoNoiseTex.wrapS=ssaoNoiseTex.wrapT=THREE.RepeatWrapping;ssaoNoiseTex.needsUpdate=true;
+
+const ssaoMat=makeFSMat(`
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D uDepth, uNoise;
+  uniform mat4 uProj, uProjInv;
+  uniform vec3 uKernel[${KERNEL_SIZE}];
+  uniform vec2 uRes, uNoiseScale;
+  uniform float uRadius, uBias, uStrength;
+
+  vec3 getViewPos(vec2 uv){
+    float d=texture2D(uDepth,uv).r*2.0-1.0;
+    vec4 p=uProjInv*vec4(uv*2.0-1.0,d,1.0);
+    return p.xyz/p.w;
+  }
+  vec3 getViewNormal(vec2 uv){
+    vec2 e=1.0/uRes;
+    vec3 p=getViewPos(uv);
+    vec3 dx=getViewPos(uv+vec2(e.x,0.0))-p;
+    vec3 dy=getViewPos(uv+vec2(0.0,e.y))-p;
+    return normalize(cross(dx,dy));
+  }
+  void main(){
+    vec3 fragPos=getViewPos(vUv);
+    if(fragPos.z>-0.1){gl_FragColor=vec4(1.0);return;}
+    vec3 normal=getViewNormal(vUv);
+    vec3 randomVec=normalize(texture2D(uNoise,vUv*uNoiseScale).rgb);
+    vec3 tangent=normalize(randomVec-normal*dot(randomVec,normal));
+    vec3 bitangent=cross(normal,tangent);
+    mat3 TBN=mat3(tangent,bitangent,normal);
+    float occlusion=0.0;
+    for(int i=0;i<${KERNEL_SIZE};i++){
+      vec3 s=TBN*uKernel[i];
+      s=fragPos+s*uRadius;
+      vec4 offset=uProj*vec4(s,1.0);
+      offset.xyz/=offset.w;
+      vec2 suv=offset.xy*.5+.5;
+      if(suv.x<0.0||suv.x>1.0||suv.y<0.0||suv.y>1.0){continue;}
+      float sampleDepth=getViewPos(suv).z;
+      float rangeCheck=smoothstep(0.0,1.0,uRadius/abs(fragPos.z-sampleDepth));
+      occlusion+=((sampleDepth>=s.z+uBias)?1.0:0.0)*rangeCheck;
+    }
+    occlusion=1.0-pow(occlusion/float(${KERNEL_SIZE}),0.8)*uStrength;
+    gl_FragColor=vec4(vec3(occlusion),1.0);
+  }
+`,{
+  uDepth:{value:null},uNoise:{value:ssaoNoiseTex},
+  uProj:{value:new THREE.Matrix4()},uProjInv:{value:new THREE.Matrix4()},
+  uKernel:{value:ssaoKernel},
+  uRes:{value:new THREE.Vector2(W,H)},
+  uNoiseScale:{value:new THREE.Vector2(W/4,H/4)},
+  uRadius:{value:0.4},uBias:{value:0.025},uStrength:{value:0.7},
+});
+
+// SSAO blur (simple 4-tap box blur)
+const ssaoBlurMat=makeFSMat(`
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D uAO;
+  uniform vec2 uRes;
+  void main(){
+    vec2 e=2.0/uRes;
+    float ao=0.0;
+    ao+=texture2D(uAO,vUv+vec2(-e.x,-e.y)).r;
+    ao+=texture2D(uAO,vUv+vec2(e.x,-e.y)).r;
+    ao+=texture2D(uAO,vUv+vec2(-e.x,e.y)).r;
+    ao+=texture2D(uAO,vUv+vec2(e.x,e.y)).r;
+    gl_FragColor=vec4(vec3(ao*.25),1.0);
+  }
+`,{uAO:{value:null},uRes:{value:new THREE.Vector2(W,H)}});
+
+// ── BLOOM SHADERS ──
+const bloomBrightMat=makeFSMat(`
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D uScene;
+  uniform float uThreshold;
+  void main(){
+    vec3 col=texture2D(uScene,vUv).rgb;
+    float lum=dot(col,vec3(0.2126,0.7152,0.0722));
+    float bright=smoothstep(uThreshold,uThreshold+0.2,lum);
+    gl_FragColor=vec4(col*bright,1.0);
+  }
+`,{uScene:{value:null},uThreshold:{value:0.55}});
+
+function makeBlurMat(horiz){
+  return makeFSMat(`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D uTex;
+    uniform vec2 uDir;
+    void main(){
+      vec2 d=uDir;
+      vec3 c=vec3(0.0);
+      c+=texture2D(uTex,vUv-d*3.0).rgb*0.0625;
+      c+=texture2D(uTex,vUv-d*2.0).rgb*0.125;
+      c+=texture2D(uTex,vUv-d*1.0).rgb*0.25;
+      c+=texture2D(uTex,vUv       ).rgb*0.125;
+      c+=texture2D(uTex,vUv+d*1.0).rgb*0.25;
+      c+=texture2D(uTex,vUv+d*2.0).rgb*0.125;
+      c+=texture2D(uTex,vUv+d*3.0).rgb*0.0625;
+      gl_FragColor=vec4(c,1.0);
+    }
+  `,{uTex:{value:null},uDir:{value:horiz?new THREE.Vector2(1/(W>>1),0):new THREE.Vector2(0,1/(H>>1))}});
+}
+const bloomBlurHMat=makeBlurMat(true);
+const bloomBlurVMat=makeBlurMat(false);
+const bloomBlurHMat2=makeBlurMat(true);
+const bloomBlurVMat2=makeBlurMat(false);
+
+// ── DOF SHADER ──
+const dofMat=makeFSMat(`
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D uScene, uDepth;
+  uniform float uFocusDist, uAperture, uNear, uFar;
+  uniform vec2 uRes;
+
+  float linearDepth(float d){
+    float z=d*2.0-1.0;
+    return (2.0*uNear*uFar)/(uFar+uNear-z*(uFar-uNear));
+  }
+  vec3 bokehSample(vec2 uv, float coc){
+    vec3 col=vec3(0.0); float total=0.0;
+    float r=coc*.008;
+    // 13-tap Poisson disk
+    vec2 disk[13];
+    disk[0]=vec2(0,0); disk[1]=vec2(.54,.0); disk[2]=vec2(-.54,0);
+    disk[3]=vec2(0,.54); disk[4]=vec2(0,-.54); disk[5]=vec2(.38,.38);
+    disk[6]=vec2(-.38,.38); disk[7]=vec2(.38,-.38); disk[8]=vec2(-.38,-.38);
+    disk[9]=vec2(.8,.2); disk[10]=vec2(-.8,.2); disk[11]=vec2(.2,.8); disk[12]=vec2(.2,-.8);
+    for(int i=0;i<13;i++){
+      vec2 o=uv+disk[i]*r;
+      col+=texture2D(uScene,o).rgb;total+=1.0;
+    }
+    return col/total;
+  }
+  void main(){
+    float d=texture2D(uDepth,vUv).r;
+    float depth=linearDepth(d);
+    float coc=abs(depth-uFocusDist)*uAperture;
+    coc=clamp(coc,0.0,8.0);
+    vec3 sharp=texture2D(uScene,vUv).rgb;
+    vec3 blurred=bokehSample(vUv,coc);
+    float blend=smoothstep(0.5,2.5,coc);
+    gl_FragColor=vec4(mix(sharp,blurred,blend),1.0);
+  }
+`,{
+  uScene:{value:null},uDepth:{value:null},
+  uFocusDist:{value:30.0},uAperture:{value:0.4},
+  uNear:{value:0.1},uFar:{value:600.0},
+  uRes:{value:new THREE.Vector2(W,H)},
+});
+
+// ── COMPOSITE + FILM GRAIN + VIGNETTE + CA + FXAA ──
+const compositeMat=makeFSMat(`
+  precision highp float;
+  varying vec2 vUv;
+  uniform sampler2D uScene, uAO, uBloom, uBloom2;
+  uniform float uBloomStr, uTime, uGrainStr, uVigStr;
+  uniform int uUseAO, uUseBloom, uUseGrain, uUseVig, uUseCA;
+  uniform vec2 uRes;
+
+  // FXAA (simplified)
+  vec3 fxaa(sampler2D tex, vec2 uv, vec2 res){
+    vec2 e=1.0/res;
+    vec3 c=texture2D(tex,uv).rgb;
+    vec3 n=texture2D(tex,uv+vec2(0,e.y)).rgb;
+    vec3 s=texture2D(tex,uv-vec2(0,e.y)).rgb;
+    vec3 ww=texture2D(tex,uv-vec2(e.x,0)).rgb;
+    vec3 ee=texture2D(tex,uv+vec2(e.x,0)).rgb;
+    float lumC=dot(c,vec3(0.299,0.587,0.114));
+    float lumN=dot(n,vec3(0.299,0.587,0.114));
+    float lumS=dot(s,vec3(0.299,0.587,0.114));
+    float lumW=dot(ww,vec3(0.299,0.587,0.114));
+    float lumE=dot(ee,vec3(0.299,0.587,0.114));
+    float maxL=max(lumC,max(max(lumN,lumS),max(lumW,lumE)));
+    float minL=min(lumC,min(min(lumN,lumS),min(lumW,lumE)));
+    float contrast=maxL-minL;
+    if(contrast<0.03) return c;
+    vec3 avg=(n+s+ww+ee)*0.25;
+    return mix(c,avg,0.5*smoothstep(0.03,0.1,contrast));
+  }
+
+  // Film grain
+  float grain(vec2 uv, float t){
+    float x=dot(uv,vec2(127.1,311.7))+t*0.1;
+    return fract(sin(x)*43758.5453)-0.5;
+  }
+
+  // ACES tone mapping
+  vec3 aces(vec3 x){
+    return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0);
+  }
+
+  void main(){
+    // FXAA scene sample
+    vec3 col = fxaa(uScene, vUv, uRes);
+
+    // AO multiply
+    if(uUseAO==1){
+      float ao=texture2D(uAO,vUv).r;
+      col*=ao;
+    }
+
+    // Bloom additive
+    if(uUseBloom==1){
+      vec3 b1=texture2D(uBloom,vUv).rgb;
+      vec3 b2=texture2D(uBloom2,vUv).rgb;
+      col+=mix(b1,b2,0.5)*uBloomStr;
+    }
+
+    // Chromatic aberration
+    if(uUseCA==1){
+      vec2 dir=(vUv-0.5)*0.003;
+      col.r=texture2D(uScene,vUv+dir).r;
+      col.b=texture2D(uScene,vUv-dir).b;
+    }
+
+    // ACES tone map
+    col=aces(col*1.1);
+
+    // Vignette
+    if(uUseVig==1){
+      vec2 vc=vUv-0.5;
+      float vig=1.0-dot(vc,vc)*uVigStr*3.5;
+      col*=max(vig,0.0);
+    }
+
+    // Film grain
+    if(uUseGrain==1){
+      col+=grain(vUv,uTime)*0.035;
+    }
+
+    // Gamma
+    col=pow(max(col,0.0),vec3(1.0/2.2));
+
+    gl_FragColor=vec4(col,1.0);
+  }
+`,{
+  uScene:{value:null},uAO:{value:null},
+  uBloom:{value:null},uBloom2:{value:null},
+  uBloomStr:{value:0.9},uTime:{value:0.0},
+  uGrainStr:{value:0.04},uVigStr:{value:0.45},
+  uUseAO:{value:1},uUseBloom:{value:1},
+  uUseGrain:{value:1},uUseVig:{value:1},uUseCA:{value:0},
+  uRes:{value:new THREE.Vector2(W,H)},
+});
+
+// ── POST PROCESS STATE ────────────────────────────────────────────────────────
+let ppSSAO=true, ppBloom=true, ppDoF=false, ppGrain=true, ppVig=true, ppCA=false;
+
+// ── MAIN RENDER FUNCTION ──────────────────────────────────────────────────────
+function renderPostProcess(){
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+
+  // 1. Render scene to texture
+  renderer.setRenderTarget(rtScene);
+  renderer.clear(true,true,true);
+  renderer.render(scene,camera);
+
+  // 2. SSAO pass
+  if(ppSSAO){
+    ssaoMat.uniforms.uDepth.value=rtScene.depthTexture;
+    ssaoMat.uniforms.uProj.value=camera.projectionMatrix;
+    ssaoMat.uniforms.uProjInv.value=camera.projectionMatrixInverse;
+    ssaoMat.uniforms.uRes.value.set(w,h);
+    ssaoMat.uniforms.uNoiseScale.value.set(w/4,h/4);
+    renderFS(ssaoMat,rtSSAO);
+    // Blur AO
+    ssaoBlurMat.uniforms.uAO.value=rtSSAO.texture;
+    ssaoBlurMat.uniforms.uRes.value.set(w,h);
+    renderFS(ssaoBlurMat,rtSSAOBlur);
+  }
+
+  // 3. Source for remaining passes
+  let sceneSource = rtScene.texture;
+
+  // 4. DoF pass
+  if(ppDoF){
+    dofMat.uniforms.uScene.value=sceneSource;
+    dofMat.uniforms.uDepth.value=rtScene.depthTexture;
+    renderFS(dofMat,rtDoF);
+    sceneSource=rtDoF.texture;
+  }
+
+  // 5. Bloom — extract bright regions
+  if(ppBloom){
+    bloomBrightMat.uniforms.uScene.value=sceneSource;
+    renderFS(bloomBrightMat,rtBloomBright);
+    // Downsample + blur pass 1 (half res)
+    bloomBlurHMat.uniforms.uTex.value=rtBloomBright.texture;
+    bloomBlurHMat.uniforms.uDir.value.set(1/(w>>1),0);
+    renderFS(bloomBlurHMat,rtBloomH);
+    bloomBlurVMat.uniforms.uTex.value=rtBloomH.texture;
+    bloomBlurVMat.uniforms.uDir.value.set(0,1/(h>>1));
+    renderFS(bloomBlurVMat,rtBloomV);
+    // Downsample + blur pass 2 (quarter res)
+    bloomBlurHMat2.uniforms.uTex.value=rtBloomV.texture;
+    bloomBlurHMat2.uniforms.uDir.value.set(1/(w>>2),0);
+    renderFS(bloomBlurHMat2,rtBloomH2);
+    bloomBlurVMat2.uniforms.uTex.value=rtBloomH2.texture;
+    bloomBlurVMat2.uniforms.uDir.value.set(0,1/(h>>2));
+    renderFS(bloomBlurVMat2,rtBloomV2);
+  }
+
+  // 6. Final composite to screen
+  compositeMat.uniforms.uScene.value=sceneSource;
+  compositeMat.uniforms.uAO.value=ppSSAO?rtSSAOBlur.texture:null;
+  compositeMat.uniforms.uBloom.value=ppBloom?rtBloomV.texture:null;
+  compositeMat.uniforms.uBloom2.value=ppBloom?rtBloomV2.texture:null;
+  compositeMat.uniforms.uUseAO.value=ppSSAO?1:0;
+  compositeMat.uniforms.uUseBloom.value=ppBloom?1:0;
+  compositeMat.uniforms.uUseGrain.value=ppGrain?1:0;
+  compositeMat.uniforms.uUseVig.value=ppVig?1:0;
+  compositeMat.uniforms.uUseCA.value=ppCA?1:0;
+  compositeMat.uniforms.uRes.value.set(w,h);
+  renderFS(compositeMat,null); // null = screen
+}
+
+// ── POST PROCESS UI WIRING ────────────────────────────────────────────────────
+function wirePPTog(id,cb){const el=document.getElementById(id);if(!el)return;el.addEventListener('click',()=>{el.classList.toggle('on');cb(el.classList.contains('on'));});}
+function wirePPSlider(id,valId,cb){
+  const sl=document.getElementById(id),vl=document.getElementById(valId);
+  if(!sl)return;
+  sl.addEventListener('input',()=>{vl.textContent=parseFloat(sl.value).toFixed(2);cb(parseFloat(sl.value));});
+}
+wirePPTog('tog-ssao',v=>{ppSSAO=v;});
+wirePPTog('tog-bloom',v=>{ppBloom=v;});
+wirePPTog('tog-dof',v=>{ppDoF=v;});
+wirePPTog('tog-grain',v=>{ppGrain=v;});
+wirePPTog('tog-vignette',v=>{ppVig=v;});
+wirePPTog('tog-ca',v=>{ppCA=v;});
+wirePPSlider('slAoStr','vAoStr',v=>ssaoMat.uniforms.uStrength.value=v);
+wirePPSlider('slAoRad','vAoRad',v=>ssaoMat.uniforms.uRadius.value=v);
+wirePPSlider('slBloomT','vBloomT',v=>bloomBrightMat.uniforms.uThreshold.value=v);
+wirePPSlider('slBloomS','vBloomS',v=>compositeMat.uniforms.uBloomStr.value=v);
+wirePPSlider('slDofFocus','vDofFocus',v=>dofMat.uniforms.uFocusDist.value=v);
+wirePPSlider('slDofAp','vDofAp',v=>dofMat.uniforms.uAperture.value=v);
+wirePPSlider('slVigStr','vVigStr',v=>compositeMat.uniforms.uVigStr.value=v);
 
 // ── ANIMATE ───────────────────────────────────────────────────────────────────
 let t=0,lastT=performance.now(),fpsCount=0,fpsTimer=0;
@@ -1383,6 +1850,7 @@ function animate(){
   requestAnimationFrame(animate);
   const now=performance.now(),dt=(now-lastT)/1000;lastT=now;t+=dt;
   terrMat.uniforms.uTime.value=t;
+  compositeMat.uniforms.uTime.value=t;
   if(animWater)waterPatches.forEach(w=>{if(w.material.uniforms)w.material.uniforms.uTime.value=t;});
   if(animWind)propMeshes.forEach(p=>{
     p.traverse(c=>{
@@ -1393,7 +1861,7 @@ function animate(){
     if(p.userData.propType==='tree_oak'||p.userData.propType==='tree_pine'){p.rotation.z=Math.sin(t*.7+p.position.x*.2)*.018;p.rotation.x=Math.cos(t*.55+p.position.z*.2)*.014;}
   });
   fpsCount++;fpsTimer+=dt;if(fpsTimer>=1){document.getElementById('stat-fps').textContent=fpsCount;fpsCount=0;fpsTimer=0;}
-  renderer.render(scene,camera);
+  renderPostProcess();
 }
 
 // ── LOAD DEFAULT PRESET ───────────────────────────────────────────────────────
