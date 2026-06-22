@@ -134,12 +134,12 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:10px; h
 .brush-cursor { position:absolute; border:1px solid rgba(200,135,58,.55); border-radius:50%; pointer-events:none; transform:translate(-50%,-50%); display:none; }
 
 /* LOADING */
-#loader { position:fixed; inset:0; background:var(--bg); display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:999; gap:14px; }
-.loader-logo { font-size:16px; letter-spacing:.4em; color:var(--accent2); }
-.loader-sub { font-size:10px; letter-spacing:.2em; color:var(--parch-dim); }
-.loader-bar-wrap { width:200px; height:2px; background:var(--border2); }
+#loader { position:fixed; inset:0; background:var(--bg); display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:999; gap:18px; }
+#loader-logo-img { width:480px; max-width:80vw; height:auto; opacity:0.92; }
+.loader-sub { font-size:10px; letter-spacing:.3em; color:var(--parch-dim); text-transform:uppercase; }
+.loader-bar-wrap { width:480px; max-width:80vw; height:2px; background:var(--border2); }
 .loader-bar { height:2px; background:var(--accent); width:0; transition:width .25s; }
-.loader-msg { font-size:9px; color:var(--text-dim); letter-spacing:.1em; }
+.loader-msg { font-size:9px; color:var(--text-dim); letter-spacing:.12em; }
 
 .statusbar { height:24px; background:var(--surface); border-top:1px solid var(--border); display:flex; align-items:center; padding:0 12px; gap:18px; flex-shrink:0; }
 .sitem { font-size:9px; letter-spacing:.08em; color:var(--text-dim); }
@@ -149,8 +149,8 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:10px; h
 <body>
 
 <div id="loader">
-  <div class="loader-logo">BATTLEMAP FORGE</div>
-  <div class="loader-sub">DUNGEON EDITION v2</div>
+  <img id="loader-logo-img" src="images/logo.png" alt="Advanced Dungeons &amp; Dragons">
+  <div class="loader-sub">Dungeon Cartographer</div>
   <div class="loader-bar-wrap"><div class="loader-bar" id="lbar"></div></div>
   <div class="loader-msg" id="lmsg">Initializing...</div>
 </div>
