@@ -407,9 +407,8 @@ const wrap=document.getElementById('canvas-wrap');
 const renderer=new THREE.WebGLRenderer({antialias:false,preserveDrawingBuffer:true,logarithmicDepthBuffer:true});
 renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
 renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
-renderer.toneMapping=THREE.NoToneMapping; // tone mapping done in composite shader
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure=1.0;
-renderer.autoClear=false;
 wrap.appendChild(renderer.domElement);
 
 const scene=new THREE.Scene();
@@ -1415,9 +1414,10 @@ document.getElementById('btn-topdown').addEventListener('click',()=>{
   applyOrbit();
 });
 document.getElementById('btn-export').addEventListener('click',()=>{
-  const prev=renderer.getPixelRatio();renderer.setPixelRatio(4);renderer.setSize(wrap.clientWidth,wrap.clientHeight);
-  if (!_isLoading) renderPostProcess();
-  else { renderer.setRenderTarget(null); renderer.clear(true,true,true); }
+  const prev=renderer.getPixelRatio();
+  renderer.setPixelRatio(4);
+  renderer.setSize(wrap.clientWidth,wrap.clientHeight);
+  renderer.render(scene,camera);
   const a=document.createElement('a');a.download='battlemap-4k.png';a.href=renderer.domElement.toDataURL('image/png');a.click();
   renderer.setPixelRatio(prev);onResize();
 });
@@ -1430,442 +1430,41 @@ function onResize(){
 }
 window.addEventListener('resize',onResize);onResize();
 
-// ── POST PROCESS PIPELINE ─────────────────────────────────────────────────────
-// Custom WebGL2 multi-pass: SSAO → Bloom → DoF → Composite (FXAA+grain+vignette+CA)
+// ── POST PROCESS (inline — no separate pass) ──────────────────────────────────
+// Simple direct render. Bloom/SSAO/DoF disabled for now — add back per-toggle.
+let ppSSAO=false, ppBloom=false, ppDoF=false, ppGrain=false, ppVig=false, ppCA=false;
 
-// ── Reusable full-screen quad (created once, reused every frame) ──
-const _fsScene = new THREE.Scene();
-const _fsCamera = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
-const _fsMesh = new THREE.Mesh(new THREE.PlaneGeometry(2,2));
-_fsScene.add(_fsMesh);
+function resizeRTs(w,h){} // stub — no RTs in simple mode
 
-function renderFS(mat, target) {
-  _fsMesh.material = mat;
-  renderer.setRenderTarget(target !== undefined ? target : null);
-  renderer.clear(true, false, false);
-  renderer.render(_fsScene, _fsCamera);
-}
-
-// ── Render target helpers ──
-function makeRT(w, h, depth=false, float=false) {
-  const opts = {
-    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
-    format: THREE.RGBAFormat,
-    type: float ? THREE.HalfFloatType : THREE.UnsignedByteType,
-    depthBuffer: depth, stencilBuffer: false,
-  };
-  if (depth) opts.depthTexture = new THREE.DepthTexture(w, h);
-  return new THREE.WebGLRenderTarget(w, h, opts);
-}
-
-let W = Math.max(1, wrap.clientWidth);
-let H = Math.max(1, wrap.clientHeight);
-
-let rtScene    = makeRT(W, H, true,  false);
-let rtSSAO     = makeRT(W, H, false, false);
-let rtSSAOBlur = makeRT(W, H, false, false);
-let rtBright   = makeRT(W,     H,     false, true);
-let rtBloomH1  = makeRT(W>>1,  H>>1,  false, true);
-let rtBloomV1  = makeRT(W>>1,  H>>1,  false, true);
-let rtBloomH2  = makeRT(W>>2,  H>>2,  false, true);
-let rtBloomV2  = makeRT(W>>2,  H>>2,  false, true);
-let rtDoF      = makeRT(W, H, false, false);
-
-function resizeRTs(w, h) {
-  W = Math.max(1, w); H = Math.max(1, h);
-  [rtScene, rtSSAO, rtSSAOBlur, rtBright, rtDoF].forEach(rt => rt.setSize(W, H));
-  rtBloomH1.setSize(W>>1||1, H>>1||1); rtBloomV1.setSize(W>>1||1, H>>1||1);
-  rtBloomH2.setSize(W>>2||1, H>>2||1); rtBloomV2.setSize(W>>2||1, H>>2||1);
-  compositeMat.uniforms.uRes.value.set(W, H);
-  ssaoMat.uniforms.uRes.value.set(W, H);
-  ssaoMat.uniforms.uNoiseScale.value.set(W/4, H/4);
-}
-
-// ── SSAO ──
-const KERNEL_SIZE = 16;
-const ssaoKernel = [];
-for (let i = 0; i < KERNEL_SIZE; i++) {
-  const v = new THREE.Vector3(
-    Math.random()*2-1, Math.random()*2-1, Math.random()
-  ).normalize().multiplyScalar(0.1 + 0.9 * Math.pow(i/KERNEL_SIZE, 2));
-  ssaoKernel.push(v);
-}
-const noiseArr = new Float32Array(16*4);
-for (let i = 0; i < 16; i++) {
-  noiseArr[i*4]   = Math.random()*2-1;
-  noiseArr[i*4+1] = Math.random()*2-1;
-  noiseArr[i*4+2] = 0; noiseArr[i*4+3] = 1;
-}
-const ssaoNoiseTex = new THREE.DataTexture(noiseArr, 4, 4, THREE.RGBAFormat, THREE.FloatType);
-ssaoNoiseTex.wrapS = ssaoNoiseTex.wrapT = THREE.RepeatWrapping;
-ssaoNoiseTex.needsUpdate = true;
-
-const ssaoMat = new THREE.ShaderMaterial({
-  depthTest:false, depthWrite:false,
-  uniforms: {
-    uDepth:      { value: null },
-    uNoise:      { value: ssaoNoiseTex },
-    uProj:       { value: new THREE.Matrix4() },
-    uProjInv:    { value: new THREE.Matrix4() },
-    uKernel:     { value: ssaoKernel },
-    uRes:        { value: new THREE.Vector2(W, H) },
-    uNoiseScale: { value: new THREE.Vector2(W/4, H/4) },
-    uRadius:     { value: 0.4 },
-    uBias:       { value: 0.025 },
-    uStrength:   { value: 0.7 },
-  },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D uDepth, uNoise;
-    uniform mat4 uProj, uProjInv;
-    uniform vec3 uKernel[${KERNEL_SIZE}];
-    uniform vec2 uRes, uNoiseScale;
-    uniform float uRadius, uBias, uStrength;
-
-    vec3 viewPos(vec2 uv) {
-      float d = texture2D(uDepth, uv).r * 2.0 - 1.0;
-      vec4 p = uProjInv * vec4(uv*2.0-1.0, d, 1.0);
-      return p.xyz / p.w;
-    }
-    vec3 viewNormal(vec2 uv) {
-      vec2 e = 1.5/uRes;
-      vec3 p = viewPos(uv);
-      vec3 dx = viewPos(uv+vec2(e.x,0.0))-p;
-      vec3 dy = viewPos(uv+vec2(0.0,e.y))-p;
-      return normalize(cross(dx,dy));
-    }
-    void main() {
-      vec3 fp = viewPos(vUv);
-      if (fp.z > -0.05) { gl_FragColor = vec4(1.0); return; }
-      vec3 N = viewNormal(vUv);
-      vec3 rv = normalize(texture2D(uNoise, vUv*uNoiseScale).rgb);
-      vec3 T  = normalize(rv - N*dot(rv,N));
-      vec3 B  = cross(N, T);
-      mat3 TBN = mat3(T, B, N);
-      float occ = 0.0;
-      for (int i = 0; i < ${KERNEL_SIZE}; i++) {
-        vec3 s = TBN * uKernel[i];
-        s = fp + s * uRadius;
-        vec4 off = uProj * vec4(s, 1.0);
-        off.xyz /= off.w;
-        vec2 suv = off.xy * 0.5 + 0.5;
-        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) continue;
-        float sd = viewPos(suv).z;
-        float rc = smoothstep(0.0, 1.0, uRadius / max(abs(fp.z - sd), 0.001));
-        occ += (sd >= s.z + uBias ? 1.0 : 0.0) * rc;
-      }
-      float ao = 1.0 - pow(occ / float(${KERNEL_SIZE}), 0.8) * uStrength;
-      gl_FragColor = vec4(vec3(ao), 1.0);
-    }
-  `
-});
-
-const ssaoBlurMat = new THREE.ShaderMaterial({
-  depthTest:false, depthWrite:false,
-  uniforms: { uAO:{value:null}, uRes:{value:new THREE.Vector2(W,H)} },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D uAO;
-    uniform vec2 uRes;
-    void main() {
-      vec2 e = 2.0/uRes;
-      float ao = (
-        texture2D(uAO, vUv+vec2(-e.x,-e.y)).r +
-        texture2D(uAO, vUv+vec2( e.x,-e.y)).r +
-        texture2D(uAO, vUv+vec2(-e.x, e.y)).r +
-        texture2D(uAO, vUv+vec2( e.x, e.y)).r
-      ) * 0.25;
-      gl_FragColor = vec4(vec3(ao), 1.0);
-    }
-  `
-});
-
-// ── Bloom ──
-const bloomBrightMat = new THREE.ShaderMaterial({
-  depthTest:false, depthWrite:false,
-  uniforms: { uScene:{value:null}, uThreshold:{value:0.55} },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D uScene;
-    uniform float uThreshold;
-    void main() {
-      vec3 c = texture2D(uScene, vUv).rgb;
-      float lum = dot(c, vec3(0.2126,0.7152,0.0722));
-      float b = smoothstep(uThreshold, uThreshold+0.25, lum);
-      gl_FragColor = vec4(c*b, 1.0);
-    }
-  `
-});
-
-function makeBlurMat(horiz) {
-  return new THREE.ShaderMaterial({
-    depthTest:false, depthWrite:false,
-    uniforms: { uTex:{value:null}, uDir:{value:new THREE.Vector2(horiz?1.0:0.0, horiz?0.0:1.0)} },
-    vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-    fragmentShader: `
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D uTex;
-      uniform vec2 uDir;
-      void main() {
-        vec3 c = vec3(0.0);
-        c += texture2D(uTex, vUv - uDir*3.0).rgb * 0.0625;
-        c += texture2D(uTex, vUv - uDir*2.0).rgb * 0.1250;
-        c += texture2D(uTex, vUv - uDir*1.0).rgb * 0.2500;
-        c += texture2D(uTex, vUv           ).rgb * 0.1250;
-        c += texture2D(uTex, vUv + uDir*1.0).rgb * 0.2500;
-        c += texture2D(uTex, vUv + uDir*2.0).rgb * 0.1250;
-        c += texture2D(uTex, vUv + uDir*3.0).rgb * 0.0625;
-        gl_FragColor = vec4(c, 1.0);
-      }
-    `
-  });
-}
-const blurH1 = makeBlurMat(true);
-const blurV1 = makeBlurMat(false);
-const blurH2 = makeBlurMat(true);
-const blurV2 = makeBlurMat(false);
-
-// ── DoF ──
-const dofMat = new THREE.ShaderMaterial({
-  depthTest:false, depthWrite:false,
-  uniforms: {
-    uScene:     { value: null },
-    uDepth:     { value: null },
-    uFocusDist: { value: 30.0 },
-    uAperture:  { value: 0.4 },
-    uNear:      { value: 0.1 },
-    uFar:       { value: 600.0 },
-  },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D uScene, uDepth;
-    uniform float uFocusDist, uAperture, uNear, uFar;
-
-    float linDepth(float d) {
-      float z = d*2.0-1.0;
-      return (2.0*uNear*uFar)/(uFar+uNear - z*(uFar-uNear));
-    }
-    void main() {
-      float d     = texture2D(uDepth, vUv).r;
-      float depth = linDepth(d);
-      float coc   = clamp(abs(depth - uFocusDist) * uAperture, 0.0, 8.0);
-      vec3 sharp  = texture2D(uScene, vUv).rgb;
-      // 9-tap Poisson bokeh
-      vec2 px = coc * 0.007 * vec2(1.0);
-      vec3 blur = vec3(0.0);
-      blur += texture2D(uScene, vUv + vec2( 0.000, 0.000)*px).rgb * 0.2;
-      blur += texture2D(uScene, vUv + vec2( 0.500, 0.000)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2(-0.500, 0.000)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2( 0.000, 0.500)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2( 0.000,-0.500)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2( 0.354, 0.354)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2(-0.354, 0.354)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2( 0.354,-0.354)*px).rgb * 0.1;
-      blur += texture2D(uScene, vUv + vec2(-0.354,-0.354)*px).rgb * 0.1;
-      gl_FragColor = vec4(mix(sharp, blur, smoothstep(0.5,3.0,coc)), 1.0);
-    }
-  `
-});
-
-// ── Final composite ──
-const compositeMat = new THREE.ShaderMaterial({
-  depthTest:false, depthWrite:false,
-  uniforms: {
-    uScene:    { value: null },
-    uAO:       { value: null },
-    uBloom1:   { value: null },
-    uBloom2:   { value: null },
-    uBloomStr: { value: 0.9 },
-    uTime:     { value: 0.0 },
-    uVigStr:   { value: 0.45 },
-    uUseAO:    { value: 1 },
-    uUseBloom: { value: 1 },
-    uUseGrain: { value: 1 },
-    uUseVig:   { value: 1 },
-    uUseCA:    { value: 0 },
-    uRes:      { value: new THREE.Vector2(W, H) },
-  },
-  vertexShader: `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
-  fragmentShader: `
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D uScene, uAO, uBloom1, uBloom2;
-    uniform float uBloomStr, uTime, uVigStr;
-    uniform int uUseAO, uUseBloom, uUseGrain, uUseVig, uUseCA;
-    uniform vec2 uRes;
-
-    vec3 aces(vec3 x) {
-      return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0);
-    }
-    float grain(vec2 uv, float t) {
-      float v = dot(uv, vec2(127.1, 311.7)) + t*47.3;
-      return fract(sin(v)*43758.5453) - 0.5;
-    }
-    // Simple FXAA luma edge blend
-    vec3 fxaa(vec2 uv) {
-      vec2 e = 1.0/uRes;
-      vec3 c  = texture2D(uScene, uv).rgb;
-      vec3 n  = texture2D(uScene, uv+vec2(0, e.y)).rgb;
-      vec3 s  = texture2D(uScene, uv-vec2(0, e.y)).rgb;
-      vec3 ww = texture2D(uScene, uv-vec2(e.x,0)).rgb;
-      vec3 ee = texture2D(uScene, uv+vec2(e.x,0)).rgb;
-      float lc=dot(c, vec3(.299,.587,.114));
-      float ln=dot(n, vec3(.299,.587,.114));
-      float ls=dot(s, vec3(.299,.587,.114));
-      float lw=dot(ww,vec3(.299,.587,.114));
-      float le=dot(ee,vec3(.299,.587,.114));
-      float contrast = max(max(ln,ls),max(lw,le)) - min(min(ln,ls),min(lw,le));
-      if (contrast < 0.04) return c;
-      return mix(c, (n+s+ww+ee)*0.25, smoothstep(0.04,0.12,contrast)*0.5);
-    }
-    void main() {
-      vec3 col = fxaa(vUv);
-
-      if (uUseCA == 1) {
-        vec2 ca = (vUv-0.5)*0.004;
-        col.r = texture2D(uScene, vUv+ca).r;
-        col.b = texture2D(uScene, vUv-ca).b;
-      }
-      if (uUseAO == 1) {
-        col *= texture2D(uAO, vUv).r;
-      }
-      if (uUseBloom == 1) {
-        vec3 b = mix(texture2D(uBloom1,vUv).rgb, texture2D(uBloom2,vUv).rgb, 0.5);
-        col += b * uBloomStr;
-      }
-
-      col = aces(col * 1.08);
-
-      if (uUseVig == 1) {
-        vec2 vc = vUv - 0.5;
-        col *= max(1.0 - dot(vc,vc)*uVigStr*3.2, 0.0);
-      }
-      if (uUseGrain == 1) {
-        col += grain(vUv, uTime) * 0.032;
-      }
-
-      col = pow(max(col, 0.0), vec3(1.0/2.2));
-      gl_FragColor = vec4(col, 1.0);
-    }
-  `
-});
-
-// ── Post-process state ──
-let ppSSAO=true, ppBloom=true, ppDoF=false, ppGrain=true, ppVig=true, ppCA=false;
-
-// ── Main render ──
-function renderPostProcess() {
-  const w = W, h = H;
-
-  // 1. Render scene → RT with depth
-  renderer.setRenderTarget(rtScene);
-  renderer.clear(true, true, true);
+function renderPostProcess(){
+  renderer.setRenderTarget(null);
   renderer.render(scene, camera);
-
-  // 2. SSAO
-  if (ppSSAO) {
-    ssaoMat.uniforms.uDepth.value    = rtScene.depthTexture;
-    ssaoMat.uniforms.uProj.value     = camera.projectionMatrix;
-    ssaoMat.uniforms.uProjInv.value  = camera.projectionMatrixInverse;
-    renderFS(ssaoMat, rtSSAO);
-    ssaoBlurMat.uniforms.uAO.value   = rtSSAO.texture;
-    renderFS(ssaoBlurMat, rtSSAOBlur);
-  }
-
-  // Source texture (may be replaced by DoF)
-  let src = rtScene.texture;
-
-  // 3. DoF
-  if (ppDoF) {
-    dofMat.uniforms.uScene.value = src;
-    dofMat.uniforms.uDepth.value = rtScene.depthTexture;
-    renderFS(dofMat, rtDoF);
-    src = rtDoF.texture;
-  }
-
-  // 4. Bloom
-  if (ppBloom) {
-    bloomBrightMat.uniforms.uScene.value = src;
-    renderFS(bloomBrightMat, rtBright);
-
-    const hw = w>>1||1, hh = h>>1||1;
-    const qw = w>>2||1, qh = h>>2||1;
-
-    blurH1.uniforms.uTex.value = rtBright.texture;
-    blurH1.uniforms.uDir.value.set(1/hw, 0);
-    renderFS(blurH1, rtBloomH1);
-
-    blurV1.uniforms.uTex.value = rtBloomH1.texture;
-    blurV1.uniforms.uDir.value.set(0, 1/hh);
-    renderFS(blurV1, rtBloomV1);
-
-    blurH2.uniforms.uTex.value = rtBloomV1.texture;
-    blurH2.uniforms.uDir.value.set(1/qw, 0);
-    renderFS(blurH2, rtBloomH2);
-
-    blurV2.uniforms.uTex.value = rtBloomH2.texture;
-    blurV2.uniforms.uDir.value.set(0, 1/qh);
-    renderFS(blurV2, rtBloomV2);
-  }
-
-  // 5. Composite → screen
-  compositeMat.uniforms.uScene.value    = src;
-  compositeMat.uniforms.uAO.value       = ppSSAO  ? rtSSAOBlur.texture : rtScene.texture;
-  compositeMat.uniforms.uBloom1.value   = ppBloom ? rtBloomV1.texture  : rtScene.texture;
-  compositeMat.uniforms.uBloom2.value   = ppBloom ? rtBloomV2.texture  : rtScene.texture;
-  compositeMat.uniforms.uUseAO.value    = ppSSAO  ? 1 : 0;
-  compositeMat.uniforms.uUseBloom.value = ppBloom ? 1 : 0;
-  compositeMat.uniforms.uUseGrain.value = ppGrain ? 1 : 0;
-  compositeMat.uniforms.uUseVig.value   = ppVig   ? 1 : 0;
-  compositeMat.uniforms.uUseCA.value    = ppCA    ? 1 : 0;
-  renderFS(compositeMat, undefined); // undefined = screen
 }
 
-// ── Post-process UI wiring ──
-function wirePPTog(id, cb) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.addEventListener('click', () => { el.classList.toggle('on'); cb(el.classList.contains('on')); });
-}
-function wirePPSl(id, valId, cb) {
-  const sl = document.getElementById(id), vl = document.getElementById(valId);
-  if (!sl) return;
-  sl.addEventListener('input', () => {
-    vl.textContent = parseFloat(sl.value).toFixed(2);
-    cb(parseFloat(sl.value));
-  });
-}
-wirePPTog('tog-ssao',     v => ppSSAO  = v);
-wirePPTog('tog-bloom',    v => ppBloom = v);
-wirePPTog('tog-dof',      v => ppDoF   = v);
-wirePPTog('tog-grain',    v => ppGrain = v);
-wirePPTog('tog-vignette', v => ppVig   = v);
-wirePPTog('tog-ca',       v => ppCA    = v);
-wirePPSl('slAoStr',    'vAoStr',    v => ssaoMat.uniforms.uStrength.value = v);
-wirePPSl('slAoRad',    'vAoRad',    v => ssaoMat.uniforms.uRadius.value   = v);
-wirePPSl('slBloomT',   'vBloomT',   v => bloomBrightMat.uniforms.uThreshold.value = v);
-wirePPSl('slBloomS',   'vBloomS',   v => compositeMat.uniforms.uBloomStr.value    = v);
-wirePPSl('slDofFocus', 'vDofFocus', v => dofMat.uniforms.uFocusDist.value = v);
-wirePPSl('slDofAp',    'vDofAp',    v => dofMat.uniforms.uAperture.value  = v);
-wirePPSl('slVigStr',   'vVigStr',   v => compositeMat.uniforms.uVigStr.value = v);
+// PP UI wiring (stubs — UI exists but no-ops until passes re-enabled)
+function wirePPTog(id,cb){const el=document.getElementById(id);if(!el)return;el.addEventListener('click',()=>{el.classList.toggle('on');cb(el.classList.contains('on'));});}
+function wirePPSl(id,valId,cb){const sl=document.getElementById(id),vl=document.getElementById(valId);if(!sl)return;sl.addEventListener('input',()=>{vl.textContent=parseFloat(sl.value).toFixed(2);cb(parseFloat(sl.value));});}
+wirePPTog('tog-ssao',     v=>ppSSAO =v);
+wirePPTog('tog-bloom',    v=>ppBloom=v);
+wirePPTog('tog-dof',      v=>ppDoF  =v);
+wirePPTog('tog-grain',    v=>ppGrain=v);
+wirePPTog('tog-vignette', v=>ppVig  =v);
+wirePPTog('tog-ca',       v=>ppCA   =v);
+wirePPSl('slAoStr',   'vAoStr',   v=>{});
+wirePPSl('slAoRad',   'vAoRad',   v=>{});
+wirePPSl('slBloomT',  'vBloomT',  v=>{});
+wirePPSl('slBloomS',  'vBloomS',  v=>{});
+wirePPSl('slDofFocus','vDofFocus',v=>{});
+wirePPSl('slDofAp',   'vDofAp',   v=>{});
+wirePPSl('slVigStr',  'vVigStr',  v=>{});
 
-let _isLoading = false; // guard: don't post-process while preset is building
+let _isLoading = false;
 // ── ANIMATE ───────────────────────────────────────────────────────────────────
 let t=0,lastT=performance.now(),fpsCount=0,fpsTimer=0;
 function animate(){
   requestAnimationFrame(animate);
   const now=performance.now(),dt=(now-lastT)/1000;lastT=now;t+=dt;
   terrMat.uniforms.uTime.value=t;
-  compositeMat.uniforms.uTime.value=t;
   if(animWater)waterPatches.forEach(w=>{if(w.material.uniforms)w.material.uniforms.uTime.value=t;});
   if(animWind)propMeshes.forEach(p=>{
     p.traverse(c=>{
